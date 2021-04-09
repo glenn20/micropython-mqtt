@@ -15,7 +15,7 @@ gc.collect()
 from network import WLAN, STA_IF, AP_IF
 import usocket as socket
 gc.collect()
-from syncom import SynCom
+from channel_syncom import ChannelSynCom
 gc.collect()
 import ustruct as struct
 from status_values import *  # Numeric status values shared with user code.
@@ -37,7 +37,6 @@ async def heartbeat():
 class Client(MQTTClient):
     def __init__(self, channel, config):
         self.channel = channel
-        self.subscriptions = {}
         # Config defaults:
         # 4 repubs, delay of 10 secs between (response_time).
         # Initially clean session.
@@ -46,6 +45,7 @@ class Client(MQTTClient):
         config['connect_coro'] = self.conn_han
         config['client_id'] = ubinascii.hexlify(unique_id())
         self.timeserver = config['timeserver']
+        self.subscriptions = {}
         super().__init__(config)
 
     # Get NTP time or 0 on any error.
@@ -83,99 +83,60 @@ class Client(MQTTClient):
         return t
 
     async def wifi_han(self, state):
-        if state:
-            self.channel.send(argformat(STATUS, WIFI_UP))
-        else:
-            self.channel.send(argformat(STATUS, WIFI_DOWN))
+        for channel in self.channels:
+            for host in channel.hosts:
+                channel.send(
+                    host,
+                    argformat(STATUS, WIFI_UP if state else WIFI_DOWN))
         blue(not state)
         await asyncio.sleep(1)
 
     async def conn_han(self, _):
-        for topic, qos in self.subscriptions.items():
-            await self.subscribe(topic, qos)
+        for topic, items in self.subscriptions.items():
+            for channel, host, qos in items:
+                await self.subscribe(topic, subs)
 
     def subs_cb(self, topic, msg, retained):
-        self.channel.send(argformat(SUBSCRIPTION, topic.decode('UTF8'), msg.decode('UTF8'), retained))
+        for channel, host, qos in self.subscriptions[topic]:
+            channel.send(host, argformat(SUBSCRIPTION, topic.decode('UTF8'), msg.decode('UTF8'), retained))
 
-class Channel(SynCom):
-    def __init__(self):
-        mtx = Pin(14, Pin.OUT)              # Define pins
-        mckout = Pin(15, Pin.OUT, value=0)  # clocks must be initialised to 0
-        mrx = Pin(13, Pin.IN)
-        mckin = Pin(12, Pin.IN)
-        super().__init__(True, mckin, mckout, mrx, mtx, string_mode = True)
-        self.cstatus = False  # Connection status
-        self.client = None
-
-# Task runs continuously. Process incoming Pyboard messages.
-# Started by main_task() after client instantiated.
-    async def from_pyboard(self):
-        client = self.client
+    # Task runs continuously. Process incoming messages from the channel.
+    # Started by main_task() after client instantiated.
+    async def from_channel(self, channel):
         while True:
-            istr = await self.await_obj(20)  # wait for string (poll interval 20ms)
+            host, istr = await channel.await_obj(20)  # wait for string (poll interval 20ms)
             s = istr.split(SEP)
             command = s[0]
             if command == PUBLISH:
-                await client.publish(s[1], s[2], bool(s[3]), int(s[4]))
+                await self.publish(s[1], s[2], bool(s[3]), int(s[4]))
                 # If qos == 1 only returns once PUBACK received.
-                self.send(argformat(STATUS, PUBOK))
+                channel.send(host, argformat(STATUS, PUBOK))
             elif command == SUBSCRIBE:
-                await client.subscribe(s[1], int(s[2]))
-                client.subscriptions[s[1]] = int(s[2])  # re-subscribe after outage
+                topic, qos = s[1], int(s[2])
+                await self.subscribe(topic, qos)
+                if topic not in self.subscriptions:
+                    self.subscriptions[topic] = []
+                self.subscriptions[topic].append((channel, host, int(s[2])))  # re-subscribe after outage
             elif command == MEM:
                 gc.collect()
                 gc.threshold(gc.mem_free() // 4 + gc.mem_alloc())
-                self.send(argformat(MEM, gc.mem_free(), gc.mem_alloc()))
+                channel.send(host, argformat(MEM, gc.mem_free(), gc.mem_alloc()))
             elif command == TIME:
-                t = await client.get_time()
-                self.send(argformat(TIME, t))
+                t = await self.get_time()
+                channel.send(host, argformat(TIME, t))
             else:
-                self.send(argformat(STATUS, UNKNOWN, 'Unknown command:', istr))
+                channel.send(host, argformat(STATUS, UNKNOWN, 'Unknown command:', istr))
 
-# Runs when channel has synchronised. No return: Pyboard resets ESP on fail.
-# Get parameters from Pyboard. Process them. Connect. Instantiate client. Start
-# from_pyboard() task. Wait forever, updating connected status.
+    # Runs when channel has synchronised. No return: Pyboard resets ESP on fail.
+    # Get parameters from Pyboard. Process them. Connect. Instantiate client. Start
+    # from_pyboard() task. Wait forever, updating connected status.
     async def main_task(self, _):
-        got_params = False
-        # Await connection parameters (init record)
-        while not got_params:
-            istr = await self.await_obj(100)
-            ilst = istr.split(SEP)
-            command = ilst[0]
-            if command == 'init':
-                got_params = True
-                ssid, pw, broker, mqtt_user, mqtt_pw, ssl_params = ilst[1:7]
-                use_default = bool(int(ilst[7]))
-                fast = bool(int(ilst[10]))
-                debug = bool(int(ilst[12]))
-                config['server'] = broker
-                config['port'] = int(ilst[8])
-                config['user'] = mqtt_user
-                config['password'] = mqtt_pw
-                config['keepalive'] = int(ilst[11])
-                config['ping_interval'] = int(ilst[16])
-                config['ssl'] = bool(int(ilst[9]))
-                config['ssl_params'] = eval(ssl_params)
-                config['response_time'] = int(ilst[15])
-                config['clean'] = bool(int(ilst[13]))
-                config['max_repubs'] = int(ilst[14])
-                config['timeserver'] = ilst[17]
-            elif command == WILL:
-                config['will'] = (ilst[1:3] + [bool(ilst[3])] + [int(ilst[4])])
-                self.send(argformat(STATUS, WILLOK))
-            else:
-                self.send(argformat(STATUS, UNKNOWN, 'Expected init, got: ', istr))
-        # Got parameters
-        if debug:
-            Client.DEBUG = True  # verbose output on UART
-
-        if fast:
-            freq(160000000)
+        channel = self.channel
 
         # try default LAN if required
         sta_if = WLAN(STA_IF)
         if use_default:
-            self.send(argformat(STATUS, DEFNET))
+            channel.send(argformat(STATUS, DEFNET))
             secs = _WIFI_DELAY
             while secs >= 0 and not sta_if.isconnected():
                 await asyncio.sleep(1)
@@ -183,9 +144,9 @@ class Channel(SynCom):
 
         # If can't use default, use specified LAN
         if not sta_if.isconnected():
-            self.send(argformat(STATUS, SPECNET))
+            channel.send(argformat(STATUS, SPECNET))
             # Pause for confirmation. User may opt to reboot instead.
-            istr = await self.await_obj(100)
+            istr = await channel.await_obj(100)
             ap = WLAN(AP_IF) # create access-point interface
             ap.active(False)         # deactivate the interface
             sta_if.active(True)
@@ -195,27 +156,29 @@ class Channel(SynCom):
 
         # WiFi is up: connect to the broker
         await asyncio.sleep(5)  # Let WiFi stabilise before connecting
-        self.client = Client(self, config)
-        self.send(argformat(STATUS, BROKER_CHECK))
+        channel.send(argformat(STATUS, BROKER_CHECK))
         try:
-            await self.client.connect()  # Clean session. Throws OSError if broker down.
+            await self.connect()  # Clean session. Throws OSError if broker down.
             # Sends BROKER_OK and RUNNING
         except OSError:
             # Cause Pyboard to reboot us when application requires it.
-            self.send(argformat(STATUS, BROKER_FAIL))
+            channel.send(argformat(STATUS, BROKER_FAIL))
             while True:
                 await asyncio.sleep(60)  # Twiddle my thumbs. PB will reset me.
 
-        self.send(argformat(STATUS, BROKER_OK))
-        self.send(argformat(STATUS, RUNNING))
+        channel.send(argformat(STATUS, BROKER_OK))
+        channel.send(argformat(STATUS, RUNNING))
         # Set channel running
-        asyncio.create_task(self.from_pyboard())
+        for channel in self.channels:
+            asyncio.create_task(self.from_channel(channel))
         while True:
             gc.collect()
             gc.threshold(gc.mem_free() // 4 + gc.mem_alloc())
             await asyncio.sleep(1)
 
+
 # Comms channel to Pyboard
-channel = Channel()
+channel = ChannelSynCom()
+client = Client(channel, config)
 asyncio.create_task(channel.start(channel.main_task))
 asyncio.run(heartbeat())
