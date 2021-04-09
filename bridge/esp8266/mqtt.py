@@ -9,7 +9,7 @@
 import gc
 import ubinascii
 from mqtt_as import MQTTClient, config
-from machine import Pin, unique_id, freq
+from machine import Pin, unique_id, freq, reset as machine_reset
 import uasyncio as asyncio
 gc.collect()
 from network import WLAN, STA_IF, AP_IF
@@ -21,22 +21,27 @@ import ustruct as struct
 from status_values import *  # Numeric status values shared with user code.
 
 _WIFI_DELAY = 15  # Time (s) to wait for default network
-blue = Pin(2, Pin.OUT, value = 1)
+wifi_led_pin = (
+    Pin(config['wifi_led_pin'], Pin.OUT, value = 1)
+    if 'wifi_led_pin' in config else None)
+heartbeat_led_pin = (
+    Pin(config['heartbeat_led_pin'], Pin.OUT)
+    if 'heartbeat_led_pin' in config else None)
 
 # Format an arbitrary list of positional args as a status_values.SEP separated string
 def argformat(*a):
     return SEP.join(['{}' for x in range(len(a))]).format(*a)
 
 async def heartbeat():
-    led = Pin(0, Pin.OUT)
+    if heartbeat_led_pin is None:
+        return
     while True:
         await asyncio.sleep_ms(500)
-        led(not led())
-
+        heartbeat_led_pin(not heartbeat_led_pin())
 
 class Client(MQTTClient):
-    def __init__(self, channel, config):
-        self.channel = channel
+    def __init__(self, channels, config):
+        self.channels = channels
         # Config defaults:
         # 4 repubs, delay of 10 secs between (response_time).
         # Initially clean session.
@@ -88,13 +93,14 @@ class Client(MQTTClient):
                 channel.send(
                     host,
                     argformat(STATUS, WIFI_UP if state else WIFI_DOWN))
-        blue(not state)
+        if wifi_led_pin is not None:
+            wifi_led_pin(not state)
         await asyncio.sleep(1)
 
     async def conn_han(self, _):
         for topic, items in self.subscriptions.items():
             for channel, host, qos in items:
-                await self.subscribe(topic, subs)
+                await self.subscribe(topic, qos)
 
     def subs_cb(self, topic, msg, retained):
         for channel, host, qos in self.subscriptions[topic]:
@@ -124,61 +130,45 @@ class Client(MQTTClient):
             elif command == TIME:
                 t = await self.get_time()
                 channel.send(host, argformat(TIME, t))
+            elif command == STATUS:
+                # A request for status of the broker
+                status = (
+                    BROKER_OK if self.isconnected() else
+                    WIFI_UP if self._sta_if.isconnected() else
+                    WIFI_DOWN)
+                channel.send(host, argformat(STATUS, status))
             else:
                 channel.send(host, argformat(STATUS, UNKNOWN, 'Unknown command:', istr))
 
-    # Runs when channel has synchronised. No return: Pyboard resets ESP on fail.
-    # Get parameters from Pyboard. Process them. Connect. Instantiate client. Start
-    # from_pyboard() task. Wait forever, updating connected status.
-    async def main_task(self, _):
-        channel = self.channel
+    async def main_task(self):
+        for channel in self.channels:
+            asyncio.create_task(channel.start())
 
-        # try default LAN if required
-        sta_if = WLAN(STA_IF)
-        if use_default:
-            channel.send(argformat(STATUS, DEFNET))
-            secs = _WIFI_DELAY
-            while secs >= 0 and not sta_if.isconnected():
-                await asyncio.sleep(1)
-                secs -= 1
+        for i in range(12, 0, -1):
+            await asyncio.sleep(5)  # Let WiFi stabilise before connecting
+            try:
+                await self.connect()  # Clean session. Throws OSError if broker down.
+                break
+            except OSError:
+                if i == 1:
+                    for channel in self.channels:
+                        for host in channel.hosts:
+                            channel.send(host, argformat(STATUS, BROKER_FAIL))
+                    # After repeated failures, reboot
+                    machine_reset()
 
-        # If can't use default, use specified LAN
-        if not sta_if.isconnected():
-            channel.send(argformat(STATUS, SPECNET))
-            # Pause for confirmation. User may opt to reboot instead.
-            istr = await channel.await_obj(100)
-            ap = WLAN(AP_IF) # create access-point interface
-            ap.active(False)         # deactivate the interface
-            sta_if.active(True)
-            sta_if.connect(ssid, pw)
-            while not sta_if.isconnected():
-                await asyncio.sleep(1)
-
-        # WiFi is up: connect to the broker
-        await asyncio.sleep(5)  # Let WiFi stabilise before connecting
-        channel.send(argformat(STATUS, BROKER_CHECK))
-        try:
-            await self.connect()  # Clean session. Throws OSError if broker down.
-            # Sends BROKER_OK and RUNNING
-        except OSError:
-            # Cause Pyboard to reboot us when application requires it.
-            channel.send(argformat(STATUS, BROKER_FAIL))
-            while True:
-                await asyncio.sleep(60)  # Twiddle my thumbs. PB will reset me.
-
-        channel.send(argformat(STATUS, BROKER_OK))
-        channel.send(argformat(STATUS, RUNNING))
+        for channel in self.channels:
+            for host in channel.hosts:
+                channel.send(host, argformat(STATUS, BROKER_OK))
+                channel.send(host, argformat(STATUS, RUNNING))
         # Set channel running
         for channel in self.channels:
             asyncio.create_task(self.from_channel(channel))
         while True:
-            gc.collect()
-            gc.threshold(gc.mem_free() // 4 + gc.mem_alloc())
             await asyncio.sleep(1)
 
 
-# Comms channel to Pyboard
-channel = ChannelSynCom()
-client = Client(channel, config)
-asyncio.create_task(channel.start(channel.main_task))
+# Comms channel to Pyboard and ESPNow clients
+client = Client([ChannelSynCom(), ChannelESPNow()], config)
+asyncio.create_task(client.main_task())
 asyncio.run(heartbeat())
