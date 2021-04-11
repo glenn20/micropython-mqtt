@@ -9,37 +9,20 @@
 import gc
 import ubinascii
 from mqtt_as import MQTTClient, config
-from machine import Pin, unique_id, freq, reset as machine_reset
+from machine import Pin, reset as machine_reset
 import uasyncio as asyncio
-gc.collect()
 from network import WLAN, STA_IF, AP_IF
 import usocket as socket
-gc.collect()
-from channel_syncom import ChannelSynCom
-gc.collect()
 import ustruct as struct
 from status_values import *  # Numeric status values shared with user code.
 
 _WIFI_DELAY = 15  # Time (s) to wait for default network
-wifi_led_pin = (
-    Pin(config['wifi_led_pin'], Pin.OUT, value = 1)
-    if 'wifi_led_pin' in config else None)
-heartbeat_led_pin = (
-    Pin(config['heartbeat_led_pin'], Pin.OUT)
-    if 'heartbeat_led_pin' in config else None)
 
 # Format an arbitrary list of positional args as a status_values.SEP separated string
 def argformat(*a):
     return SEP.join(['{}' for x in range(len(a))]).format(*a)
 
-async def heartbeat():
-    if heartbeat_led_pin is None:
-        return
-    while True:
-        await asyncio.sleep_ms(500)
-        heartbeat_led_pin(not heartbeat_led_pin())
-
-class Client(MQTTClient):
+class MQTTProxy(MQTTClient):
     def __init__(self, channels, config):
         self.channels = channels
         # Config defaults:
@@ -48,10 +31,12 @@ class Client(MQTTClient):
         config['subs_cb'] = self.subs_cb
         config['wifi_coro'] = self.wifi_han
         config['connect_coro'] = self.conn_han
-        config['client_id'] = ubinascii.hexlify(unique_id())
         self.timeserver = config['timeserver']
         self.subscriptions = {}
         super().__init__(config)
+        self._wifi_led = (
+            Pin(config['wifi_led_pin'], Pin.OUT, value = 1)
+            if config.get('wifi_led_pin', None) is not None else None)
 
     # Get NTP time or 0 on any error.
     async def get_time(self):
@@ -88,13 +73,9 @@ class Client(MQTTClient):
         return t
 
     async def wifi_han(self, state):
-        for channel in self.channels:
-            for host in channel.hosts:
-                channel.send(
-                    host,
-                    argformat(STATUS, WIFI_UP if state else WIFI_DOWN))
-        if wifi_led_pin is not None:
-            wifi_led_pin(not state)
+        self.broadcast(argformat(STATUS, WIFI_UP if state else WIFI_DOWN))
+        if self._wifi_led is not None:
+            self._wifi_led(not state)
         await asyncio.sleep(1)
 
     async def conn_han(self, _):
@@ -102,9 +83,16 @@ class Client(MQTTClient):
             for channel, host, qos in items:
                 await self.subscribe(topic, qos)
 
+    # Forward message to all hosts subscribed to this topic
     def subs_cb(self, topic, msg, retained):
-        for channel, host, qos in self.subscriptions[topic]:
-            channel.send(host, argformat(SUBSCRIPTION, topic.decode('UTF8'), msg.decode('UTF8'), retained))
+        for channel, host, qos in self.subscriptions.[topic]:
+            channel.send(host, argformat(SUBSCRIPTION, topic, msg, retained))
+
+    # Send message to all connected hosts on all channels
+    def broadcast(self, msg):
+        for channel in self.channels:
+            for host in channel.hosts:
+                channel.send(host, msg)
 
     # Task runs continuously. Process incoming messages from the channel.
     # Started by main_task() after client instantiated.
@@ -132,15 +120,19 @@ class Client(MQTTClient):
                 channel.send(host, argformat(TIME, t))
             elif command == STATUS:
                 # A request for status of the broker
-                status = (
-                    BROKER_OK if self.isconnected() else
-                    WIFI_UP if self._sta_if.isconnected() else
-                    WIFI_DOWN)
-                channel.send(host, argformat(STATUS, status))
+                channel.send(
+                    host,
+                    argformat(
+                        STATUS,
+                        WIFI_UP if self._sta_if.isconnected() else
+                        WIFI_DOWN))
+                if self.isconnected():
+                    channel.send(host, argformat(STATUS, BROKER_OK))
+                    channel.broadcast(argformat(STATUS, RUNNING))
             else:
                 channel.send(host, argformat(STATUS, UNKNOWN, 'Unknown command:', istr))
 
-    async def main_task(self):
+    async def run(self):
         for channel in self.channels:
             asyncio.create_task(channel.start())
 
@@ -150,25 +142,18 @@ class Client(MQTTClient):
                 await self.connect()  # Clean session. Throws OSError if broker down.
                 break
             except OSError:
+                # After repeated failures, reboot
                 if i == 1:
-                    for channel in self.channels:
-                        for host in channel.hosts:
-                            channel.send(host, argformat(STATUS, BROKER_FAIL))
-                    # After repeated failures, reboot
+                    self.broadcast(argformat(STATUS, BROKER_FAIL))
                     machine_reset()
 
-        for channel in self.channels:
-            for host in channel.hosts:
-                channel.send(host, argformat(STATUS, BROKER_OK))
-                channel.send(host, argformat(STATUS, RUNNING))
-        # Set channel running
+        channel.broadcast(argformat(STATUS, BROKER_OK))
+        channel.broadcast(argformat(STATUS, RUNNING))
+
+        # Set channels running
         for channel in self.channels:
             asyncio.create_task(self.from_channel(channel))
+
+        # ??? Is this necessary?
         while True:
             await asyncio.sleep(1)
-
-
-# Comms channel to Pyboard and ESPNow clients
-client = Client([ChannelSynCom(), ChannelESPNow()], config)
-asyncio.create_task(client.main_task())
-asyncio.run(heartbeat())
